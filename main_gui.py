@@ -38,10 +38,17 @@ class PoseTrackerGUI:
         self.csv_writer = None
         self.frame_count = 0
         self.export_format = "MediaPipe 33"  # Default format
+        self.csv_buffer = []  # Buffer for CSV rows
+        
+        # Landmark configurations
+        self.landmarks_config = None
         
         # FPS tracking
         self.fps_start_time = 0
         self.fps_counter = 0
+        
+        # Pre-create timestamp for less overhead
+        self.last_timestamp = None
         
         # Canvas image object
         self.canvas_image = None
@@ -263,46 +270,43 @@ class PoseTrackerGUI:
         self.csv_file = open(filename, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         
-        # MediaPipe pose landmark names (33 landmarks in order)
-        landmark_names = [
-            'nose', 'left_eye_inner', 'left_eye', 'left_eye_outer',
-            'right_eye_inner', 'right_eye', 'right_eye_outer',
-            'left_ear', 'right_ear', 'mouth_left', 'mouth_right',
-            'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
-            'left_wrist', 'right_wrist', 'left_pinky', 'right_pinky',
-            'left_index', 'right_index', 'left_thumb', 'right_thumb',
-            'left_hip', 'right_hip', 'left_knee', 'right_knee',
-            'left_ankle', 'right_ankle', 'left_heel', 'right_heel',
-            'left_foot_index', 'right_foot_index'
-        ]
-        
+        # Define landmark configurations
         if self.export_format == "MediaPipe 33":
-            # MediaPipe 33 format - all 33 landmarks with visibility
-            header = ['timestamp', 'frame']
-            for name in landmark_names:
-                header.extend([f'{name}_x', f'{name}_y', f'{name}_z', f'{name}_visibility'])
-            self.csv_writer.writerow(header)
+            # MediaPipe 33
+            self.landmarks_config = [
+                (0, 'nose'), (1, 'left_eye_inner'), (2, 'left_eye'), (3, 'left_eye_outer'),
+                (4, 'right_eye_inner'), (5, 'right_eye'), (6, 'right_eye_outer'),
+                (7, 'left_ear'), (8, 'right_ear'), (9, 'mouth_left'), (10, 'mouth_right'),
+                (11, 'left_shoulder'), (12, 'right_shoulder'), (13, 'left_elbow'), (14, 'right_elbow'),
+                (15, 'left_wrist'), (16, 'right_wrist'), (17, 'left_pinky'), (18, 'right_pinky'),
+                (19, 'left_index'), (20, 'right_index'), (21, 'left_thumb'), (22, 'right_thumb'),
+                (23, 'left_hip'), (24, 'right_hip'), (25, 'left_knee'), (26, 'right_knee'),
+                (27, 'left_ankle'), (28, 'right_ankle'), (29, 'left_heel'), (30, 'right_heel'),
+                (31, 'left_foot_index'), (32, 'right_foot_index')
+            ]
         else:
-            # RR21 format - 13 key landmarks without visibility
-            header = ['frame', 'timestamp',
-                     'nose_x', 'nose_y', 'nose_z',
-                     'left_shoulder_x', 'left_shoulder_y', 'left_shoulder_z',
-                     'right_shoulder_x', 'right_shoulder_y', 'right_shoulder_z',
-                     'left_elbow_x', 'left_elbow_y', 'left_elbow_z',
-                     'right_elbow_x', 'right_elbow_y', 'right_elbow_z',
-                     'left_wrist_x', 'left_wrist_y', 'left_wrist_z',
-                     'right_wrist_x', 'right_wrist_y', 'right_wrist_z',
-                     'left_hip_x', 'left_hip_y', 'left_hip_z',
-                     'right_hip_x', 'right_hip_y', 'right_hip_z',
-                     'left_knee_x', 'left_knee_y', 'left_knee_z',
-                     'right_knee_x', 'right_knee_y', 'right_knee_z',
-                     'left_ankle_x', 'left_ankle_y', 'left_ankle_z',
-                     'right_ankle_x', 'right_ankle_y', 'right_ankle_z']
-            self.csv_writer.writerow(header)
+            # RR21
+            self.landmarks_config = [
+                (0, 'nose'),
+                (2, 'left_eye'), (5, 'right_eye'),
+                (7, 'left_ear'), (8, 'right_ear'),
+                (11, 'left_shoulder'), (12, 'right_shoulder'),
+                (13, 'left_elbow'), (14, 'right_elbow'),
+                (15, 'left_wrist'), (16, 'right_wrist'),
+                (23, 'left_hip'), (24, 'right_hip'),
+                (25, 'left_knee'), (26, 'right_knee'),
+                (27, 'left_ankle'), (28, 'right_ankle'),
+                (29, 'left_heel'), (30, 'right_heel'),
+                (31, 'left_foot_index'), (32, 'right_foot_index')
+            ]
         
-        # Reset frame counter to 0 when starting recording
+        # Build header - consistent format for both: x, y, depth, visibility
+        header = ['frame', 'timestamp']
+        for idx, name in self.landmarks_config:
+            header.extend([f'{name}_x', f'{name}_y', f'{name}_depth', f'{name}_visibility'])
+        self.csv_writer.writerow(header)
+        
         self.frame_count = 0
-        
         self.is_recording = True
         self.record_btn.config(text="⏹ Stop Recording", bg="#27ae60")
         self.record_status.config(text="🔴 Recording... Frame: 0", fg="#e74c3c")
@@ -311,6 +315,11 @@ class PoseTrackerGUI:
     def stop_recording(self):
         """Stop CSV recording"""
         if self.csv_file:
+            # Write any remaining buffered rows
+            if self.csv_buffer:
+                self.csv_writer.writerows(self.csv_buffer)
+                self.csv_buffer = []
+            
             self.csv_file.close()
             self.csv_file = None
             self.csv_writer = None
@@ -358,33 +367,30 @@ class PoseTrackerGUI:
             # Save to CSV if recording
             if self.is_recording and self.csv_writer:
                 landmarks = results.pose_landmarks.landmark
+                timestamp = datetime.now().isoformat()
                 
-                if self.export_format == "MediaPipe 33":
-                    # Save all 33 landmarks with visibility
-                    row = [datetime.now().isoformat(), self.frame_count]
-                    for landmark in landmarks:
-                        row.extend([landmark.x, landmark.y, landmark.z, landmark.visibility])
-                    self.csv_writer.writerow(row)
-                else:
-                    # RR21 format - 13 key landmarks (indices from MediaPipe)
-                    # 0:nose, 11:left_shoulder, 12:right_shoulder, 13:left_elbow, 14:right_elbow,
-                    # 15:left_wrist, 16:right_wrist, 23:left_hip, 24:right_hip,
-                    # 25:left_knee, 26:right_knee, 27:left_ankle, 28:right_ankle
-                    key_indices = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
-                    row = [self.frame_count, datetime.now().isoformat()]
-                    for idx in key_indices:
-                        row.extend([landmarks[idx].x, landmarks[idx].y, landmarks[idx].z])
-                    self.csv_writer.writerow(row)
+                # Build row using the same configuration
+                row = [self.frame_count, timestamp]
+                for idx, name in self.landmarks_config:
+                    lm = landmarks[idx]
+                    row.extend([lm.x, lm.y, lm.z])
+                    if self.include_visibility:
+                        row.append(lm.visibility)
+                self.csv_buffer.append(row)
+                
+                # Write buffer every 30 frames
+                if len(self.csv_buffer) >= 30:
+                    self.csv_writer.writerows(self.csv_buffer)
+                    self.csv_buffer = []
+                    self.csv_file.flush()
         
         # Convert to PhotoImage for Tkinter
         display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(display_frame)
-        
-        # Use cached display size (only updated on window resize)
         img = img.resize((self.display_width, self.display_height), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(image=img)
         
-        # Update canvas more efficiently (centered)
+        # Update canvas
         center_x = self.last_canvas_width // 2
         center_y = self.last_canvas_height // 2
         
@@ -393,7 +399,7 @@ class PoseTrackerGUI:
         else:
             self.canvas.coords(self.canvas_image, center_x, center_y)
             self.canvas.itemconfig(self.canvas_image, image=photo)
-        self.canvas.image = photo  # Keep reference
+        self.canvas.image = photo
         
         # Update FPS
         if time.time() - self.fps_start_time >= 1.0:
@@ -401,11 +407,9 @@ class PoseTrackerGUI:
             self.fps_counter = 0
             self.fps_start_time = time.time()
         
-        # Update frame counter only when recording
         if self.is_recording:
             self.record_status.config(text=f"🔴 Recording... Frame: {self.frame_count}")
         
-        # Schedule next frame update
         self.root.after(10, self.update_frame)
             
     def on_closing(self):
