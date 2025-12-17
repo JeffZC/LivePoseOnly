@@ -27,6 +27,11 @@ class PoseTrackerGUI:
         self.display_mode = 2  # 0=normal, 1=blurred, 2=pose only (default: pose only)
         self.mode_names = ["Normal Video", "Blurred Video", "Pose Only"]
         
+        # Camera resolution (will be set when camera opens)
+        self.camera_width = 640
+        self.camera_height = 480
+        self.camera_aspect_ratio = 4 / 3
+        
         # CSV recording
         self.is_recording = False
         self.csv_file = None
@@ -40,9 +45,18 @@ class PoseTrackerGUI:
         # Canvas image object
         self.canvas_image = None
         
+        # Cached display size
+        self.display_width = 800
+        self.display_height = 600
+        self.last_canvas_width = 0
+        self.last_canvas_height = 0
+        
         self.setup_ui()
         self.detect_cameras()
         
+        # Bind canvas resize event
+        self.canvas.bind('<Configure>', self.on_canvas_resize)
+    
     def setup_ui(self):
         # Top control panel
         control_frame = tk.Frame(self.root, bg="#2c3e50", height=120)
@@ -77,11 +91,9 @@ class PoseTrackerGUI:
         self.record_status = tk.Label(control_frame, text="Not Recording", bg="#2c3e50", fg="#95a5a6", font=("Arial", 9))
         self.record_status.place(x=400, y=70)
         
-        # FPS and frame counter
+        # FPS counter (always visible)
         self.fps_label = tk.Label(control_frame, text="FPS: 0", bg="#2c3e50", fg="#ecf0f1", font=("Arial", 10))
         self.fps_label.place(x=600, y=10)
-        self.frame_label = tk.Label(control_frame, text="Frames: 0", bg="#2c3e50", fg="#ecf0f1", font=("Arial", 10))
-        self.frame_label.place(x=600, y=35)
         
         # Warning label
         warning = tk.Label(control_frame, text="⚠ VIDEO IS NOT SAVED - Only pose data can be exported to CSV", 
@@ -142,8 +154,18 @@ class PoseTrackerGUI:
             messagebox.showerror("Error", f"Could not open camera {self.camera_index}")
             return
         
+        # Use 640x480 for optimal pose detection performance
+        # This is the sweet spot for MediaPipe - smooth and accurate
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        # Read actual resolution the camera is using
+        self.camera_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.camera_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.camera_aspect_ratio = self.camera_width / self.camera_height
+        
+        print(f"Camera resolution: {self.camera_width}x{self.camera_height} (aspect ratio: {self.camera_aspect_ratio:.2f})")
         
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
@@ -159,7 +181,7 @@ class PoseTrackerGUI:
         self.fps_start_time = time.time()
         self.start_btn.config(text="⏹ Stop Camera", bg="#e74c3c")
         self.record_btn.config(state=tk.NORMAL)
-        self.status_label.config(text=f"Camera {self.camera_index} running")
+        self.status_label.config(text=f"Camera {self.camera_index}: {self.camera_width}x{self.camera_height} running")
         
         # Start video loop with after()
         self.update_frame()
@@ -180,7 +202,28 @@ class PoseTrackerGUI:
         self.record_btn.config(state=tk.DISABLED)
         self.status_label.config(text="Camera stopped")
         self.canvas.delete("all")
+        self.canvas_image = None  # Reset canvas image object
+        self.frame_count = 0
+        self.fps_counter = 0
         
+    def on_canvas_resize(self, event):
+        """Called only when canvas is resized"""
+        if event.width != self.last_canvas_width or event.height != self.last_canvas_height:
+            self.last_canvas_width = event.width
+            self.last_canvas_height = event.height
+            
+            aspect_ratio = self.camera_aspect_ratio
+            
+            if event.width / event.height > aspect_ratio:
+                self.display_height = event.height - 20
+                self.display_width = int(self.display_height * aspect_ratio)
+            else:
+                self.display_width = event.width - 20
+                self.display_height = int(self.display_width / aspect_ratio)
+            
+            self.display_width = max(320, self.display_width)
+            self.display_height = max(240, self.display_height)
+    
     def toggle_display_mode(self):
         """Toggle display mode"""
         self.display_mode = (self.display_mode + 1) % 3
@@ -214,9 +257,12 @@ class PoseTrackerGUI:
             header.extend([f'landmark_{i}_x', f'landmark_{i}_y', f'landmark_{i}_z', f'landmark_{i}_visibility'])
         self.csv_writer.writerow(header)
         
+        # Reset frame counter to 0 when starting recording
+        self.frame_count = 0
+        
         self.is_recording = True
         self.record_btn.config(text="⏹ Stop Recording", bg="#27ae60")
-        self.record_status.config(text="🔴 Recording...", fg="#e74c3c")
+        self.record_status.config(text="🔴 Recording... Frame: 0", fg="#e74c3c")
         self.status_label.config(text=f"Recording to: {filename}")
         
     def stop_recording(self):
@@ -276,13 +322,19 @@ class PoseTrackerGUI:
         # Convert to PhotoImage for Tkinter
         display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(display_frame)
-        img = img.resize((800, 600), Image.Resampling.LANCZOS)
+        
+        # Use cached display size (only updated on window resize)
+        img = img.resize((self.display_width, self.display_height), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(image=img)
         
-        # Update canvas more efficiently
+        # Update canvas more efficiently (centered)
+        center_x = self.last_canvas_width // 2
+        center_y = self.last_canvas_height // 2
+        
         if self.canvas_image is None:
-            self.canvas_image = self.canvas.create_image(400, 300, image=photo)
+            self.canvas_image = self.canvas.create_image(center_x, center_y, image=photo)
         else:
+            self.canvas.coords(self.canvas_image, center_x, center_y)
             self.canvas.itemconfig(self.canvas_image, image=photo)
         self.canvas.image = photo  # Keep reference
         
@@ -291,10 +343,12 @@ class PoseTrackerGUI:
             self.fps_label.config(text=f"FPS: {self.fps_counter}")
             self.fps_counter = 0
             self.fps_start_time = time.time()
-            
-        self.frame_label.config(text=f"Frames: {self.frame_count}")
         
-        # Schedule next frame update (30ms = ~33 FPS)
+        # Update frame counter only when recording
+        if self.is_recording:
+            self.record_status.config(text=f"🔴 Recording... Frame: {self.frame_count}")
+        
+        # Schedule next frame update
         self.root.after(10, self.update_frame)
             
     def on_closing(self):
