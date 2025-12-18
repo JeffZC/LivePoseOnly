@@ -7,6 +7,8 @@ from PIL import Image, ImageTk
 import csv
 from datetime import datetime
 import time
+import sys  # Add this at the top with other imports
+import os  # Add this at the top with other imports
 
 class PoseTrackerGUI:
     def __init__(self, root):
@@ -26,6 +28,7 @@ class PoseTrackerGUI:
         self.is_running = False
         self.display_mode = 2  # 0=normal, 1=blurred, 2=pose only (default: pose only)
         self.mode_names = ["Normal Video", "Blurred Video", "Pose Only"]
+        self.blur_alpha = 0.5  # Transparency for blurred mode (0=opaque, 1=transparent)
         
         # Camera resolution (will be set when camera opens)
         self.camera_width = 640
@@ -42,13 +45,11 @@ class PoseTrackerGUI:
         
         # Landmark configurations
         self.landmarks_config = None
+        self.include_visibility = False
         
         # FPS tracking
         self.fps_start_time = 0
         self.fps_counter = 0
-        
-        # Pre-create timestamp for less overhead
-        self.last_timestamp = None
         
         # Canvas image object
         self.canvas_image = None
@@ -58,6 +59,9 @@ class PoseTrackerGUI:
         self.display_height = 600
         self.last_canvas_width = 0
         self.last_canvas_height = 0
+        
+        # Track after() callback ID
+        self.after_id = None
         
         self.setup_ui()
         self.detect_cameras()
@@ -72,48 +76,54 @@ class PoseTrackerGUI:
         control_frame.pack_propagate(False)
         
         # Camera selection
-        tk.Label(control_frame, text="Camera:", bg="#2c3e50", fg="white", font=("Arial", 10)).place(x=10, y=10)
+        tk.Label(control_frame, text="Camera:", bg="#2c3e50", fg="white").place(x=10, y=10)
         self.camera_var = tk.StringVar()
-        self.camera_dropdown = ttk.Combobox(control_frame, textvariable=self.camera_var, state="readonly", width=15)
+        self.camera_dropdown = ttk.Combobox(control_frame, textvariable=self.camera_var, state="readonly", width=18)
         self.camera_dropdown.place(x=10, y=35)
         self.camera_dropdown.bind("<<ComboboxSelected>>", self.change_camera)
         
         # Start/Stop button
         self.start_btn = tk.Button(control_frame, text="▶ Start Camera", command=self.toggle_camera, 
-                                    bg="#27ae60", fg="white", font=("Arial", 12, "bold"), width=15)
+                                    bg="#27ae60", fg="white", width=18)
         self.start_btn.place(x=10, y=70)
         
-        # Display mode buttons
-        tk.Label(control_frame, text="Display Mode:", bg="#2c3e50", fg="white", font=("Arial", 10)).place(x=200, y=10)
-        self.mode_btn = tk.Button(control_frame, text="🔄 Toggle Mode", command=self.toggle_display_mode,
-                                   bg="#3498db", fg="white", font=("Arial", 10), width=15)
-        self.mode_btn.place(x=200, y=35)
-        self.mode_label = tk.Label(control_frame, text="Mode: Pose Only", bg="#2c3e50", fg="#ecf0f1", font=("Arial", 9))
-        self.mode_label.place(x=200, y=70)
+        # Display mode selection
+        tk.Label(control_frame, text="Display Mode:", bg="#2c3e50", fg="white").place(x=250, y=10)
+        self.mode_var = tk.StringVar(value="Pose Only")
+        self.mode_dropdown = ttk.Combobox(control_frame, textvariable=self.mode_var, state="readonly", width=18)
+        self.mode_dropdown['values'] = ["Normal Video", "Blurred Video", "Pose Only"]
+        self.mode_dropdown.place(x=250, y=35)
+        self.mode_dropdown.bind("<<ComboboxSelected>>", self.change_display_mode)
+        
+        # Blur transparency slider (with built-in label) - same width as dropdowns/buttons
+        self.blur_slider = tk.Scale(control_frame, from_=0, to=100, orient=tk.HORIZONTAL,
+                                      command=self.update_blur_alpha, length=130,
+                                      bg="#2c3e50", fg="white", highlightthickness=0,
+                                      troughcolor="#34495e", activebackground="#3498db",
+                                      label="Transparency", showvalue=True)
+        self.blur_slider.set(50)  # Default 50% transparency
+        
+        # Hide initially
+        self.blur_slider.place_forget()
         
         # Export format selection
-        tk.Label(control_frame, text="Export Format:", bg="#2c3e50", fg="white", font=("Arial", 10)).place(x=400, y=10)
+        tk.Label(control_frame, text="Export Format:", bg="#2c3e50", fg="white").place(x=490, y=10)
         self.format_var = tk.StringVar(value="MediaPipe 33")
-        self.format_dropdown = ttk.Combobox(control_frame, textvariable=self.format_var, state="readonly", width=15)
+        self.format_dropdown = ttk.Combobox(control_frame, textvariable=self.format_var, state="readonly", width=18)
         self.format_dropdown['values'] = ["MediaPipe 33", "RR21"]
-        self.format_dropdown.place(x=400, y=35)
+        self.format_dropdown.place(x=490, y=35)
         self.format_dropdown.bind("<<ComboboxSelected>>", self.change_format)
         
         # Recording controls
         self.record_btn = tk.Button(control_frame, text="⏺ Start Recording", command=self.toggle_recording,
-                                     bg="#e74c3c", fg="white", font=("Arial", 10, "bold"), width=15, state=tk.DISABLED)
-        self.record_btn.place(x=400, y=70)
-        self.record_status = tk.Label(control_frame, text="Not Recording", bg="#2c3e50", fg="#95a5a6", font=("Arial", 9))
-        self.record_status.place(x=400, y=105)
+                                     bg="#e74c3c", fg="white", width=18, state=tk.DISABLED)
+        self.record_btn.place(x=490, y=70)
+        self.record_status = tk.Label(control_frame, text="Not Recording", bg="#2c3e50", fg="#95a5a6")
+        self.record_status.place(x=490, y=105)
         
-        # FPS counter (always visible)
-        self.fps_label = tk.Label(control_frame, text="FPS: 0", bg="#2c3e50", fg="#ecf0f1", font=("Arial", 10))
-        self.fps_label.place(x=600, y=10)
-        
-        # Warning label
-        warning = tk.Label(control_frame, text="⚠ VIDEO IS NOT SAVED - Only pose data can be exported to CSV", 
-                          bg="#2c3e50", fg="#f39c12", font=("Arial", 9, "italic"))
-        warning.place(x=10, y=115)
+        # FPS counter
+        self.fps_label = tk.Label(control_frame, text="FPS: 0", bg="#2c3e50", fg="#ecf0f1")
+        self.fps_label.place(x=730, y=10)
         
         # Video display canvas
         self.canvas = tk.Canvas(self.root, bg="black")
@@ -123,13 +133,18 @@ class PoseTrackerGUI:
         status_frame = tk.Frame(self.root, bg="#34495e", height=30)
         status_frame.pack(fill=tk.X, side=tk.BOTTOM)
         self.status_label = tk.Label(status_frame, text="Ready - Select camera and click Start", 
-                                     bg="#34495e", fg="white", font=("Arial", 9))
+                                     bg="#34495e", fg="white")
         self.status_label.pack(side=tk.LEFT, padx=10)
+        
+        # Warning label in status bar
+        warning = tk.Label(status_frame, text="⚠ VIDEO NOT SAVED • Pose data only", 
+                          bg="#34495e", fg="#f39c12")
+        warning.pack(side=tk.RIGHT, padx=10)
         
     def detect_cameras(self):
         """Detect available cameras"""
         self.available_cameras = []
-        for i in range(5):
+        for i in range(3):  # Check only first 3 cameras for faster startup
             temp_cap = cv2.VideoCapture(i)
             if temp_cap.isOpened():
                 self.available_cameras.append(i)
@@ -174,10 +189,11 @@ class PoseTrackerGUI:
             messagebox.showerror("Error", f"Could not open camera {self.camera_index}")
             return
         
-        # Use 640x480 for optimal pose detection performance
+        # Optimize camera settings for speed
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         # Read actual resolution the camera is using
         self.camera_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -186,6 +202,7 @@ class PoseTrackerGUI:
         
         print(f"Camera resolution: {self.camera_width}x{self.camera_height} (aspect ratio: {self.camera_aspect_ratio:.2f})")
         
+        # Use Lite model for faster loading and processing
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
             model_complexity=1,
@@ -243,10 +260,20 @@ class PoseTrackerGUI:
             self.display_width = max(320, self.display_width)
             self.display_height = max(240, self.display_height)
     
-    def toggle_display_mode(self):
-        """Toggle display mode"""
-        self.display_mode = (self.display_mode + 1) % 3
-        self.mode_label.config(text=f"Mode: {self.mode_names[self.display_mode]}")
+    def change_display_mode(self, event=None):
+        """Change display mode via dropdown"""
+        selected = self.mode_var.get()
+        self.display_mode = self.mode_names.index(selected)
+        
+        # Show/hide blur slider based on mode
+        if selected == "Blurred Video":
+            self.blur_slider.place(x=250, y=70)
+        else:
+            self.blur_slider.place_forget()
+    
+    def update_blur_alpha(self, value):
+        """Update blur transparency level"""
+        self.blur_alpha = float(value) / 100.0
         
     def toggle_recording(self):
         """Start or stop CSV recording"""
@@ -332,6 +359,7 @@ class PoseTrackerGUI:
     def update_frame(self):
         """Update video frame"""
         if not self.is_running:
+            self.after_id = None  # Clear the callback ID
             return
             
         success, frame = self.cap.read()
@@ -349,8 +377,11 @@ class PoseTrackerGUI:
         # Prepare display frame based on mode
         if self.display_mode == 0:  # Normal
             display_frame = frame.copy()
-        elif self.display_mode == 1:  # Blurred
-            display_frame = cv2.GaussianBlur(frame, (51, 51), 0)
+        elif self.display_mode == 1:  # Blurred with transparency
+            blurred = cv2.GaussianBlur(frame, (51, 51), 0)
+            black_bg = np.zeros_like(frame)
+            # Blend: more alpha = more transparent (towards black)
+            display_frame = cv2.addWeighted(blurred, 1 - self.blur_alpha, black_bg, self.blur_alpha, 0)
         else:  # Pose only
             display_frame = np.zeros_like(frame)
         
@@ -369,17 +400,15 @@ class PoseTrackerGUI:
                 landmarks = results.pose_landmarks.landmark
                 timestamp = datetime.now().isoformat()
                 
-                # Build row using the same configuration
+                # Build row - consistent format: x, y, depth, visibility
                 row = [self.frame_count, timestamp]
                 for idx, name in self.landmarks_config:
                     lm = landmarks[idx]
-                    row.extend([lm.x, lm.y, lm.z])
-                    if self.include_visibility:
-                        row.append(lm.visibility)
+                    row.extend([lm.x, lm.y, lm.z, lm.visibility])
                 self.csv_buffer.append(row)
                 
-                # Write buffer every 30 frames
-                if len(self.csv_buffer) >= 30:
+                # Write buffer every 60 frames
+                if len(self.csv_buffer) >= 60:
                     self.csv_writer.writerows(self.csv_buffer)
                     self.csv_buffer = []
                     self.csv_file.flush()
@@ -387,7 +416,11 @@ class PoseTrackerGUI:
         # Convert to PhotoImage for Tkinter
         display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(display_frame)
-        img = img.resize((self.display_width, self.display_height), Image.Resampling.LANCZOS)
+        
+        # Resize with faster algorithm
+        if (self.display_width != img.width or self.display_height != img.height):
+            img = img.resize((self.display_width, self.display_height), Image.Resampling.BILINEAR)
+        
         photo = ImageTk.PhotoImage(image=img)
         
         # Update canvas
@@ -410,13 +443,34 @@ class PoseTrackerGUI:
         if self.is_recording:
             self.record_status.config(text=f"🔴 Recording... Frame: {self.frame_count}")
         
-        self.root.after(10, self.update_frame)
+        # Schedule next update and save the ID
+        self.after_id = self.root.after(10, self.update_frame)
             
     def on_closing(self):
-        """Handle window close"""
-        if self.is_running:
-            self.stop_camera()
-        self.root.destroy()
+        """Handle window close - standard Python/Tkinter cleanup"""
+        # 1. Stop the update loop
+        self.is_running = False
+        
+        # 2. Cancel pending callbacks
+        if self.after_id is not None:
+            self.root.after_cancel(self.after_id)
+            self.after_id = None
+        
+        # 3. Close recording
+        if self.is_recording:
+            self.stop_recording()
+        
+        # 4. Release resources
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        
+        if self.pose is not None:
+            self.pose.close()
+            self.pose = None
+        
+        # 5. Standard Tkinter cleanup
+        self.root.destroy()  # This is enough - no quit() needed
 
 if __name__ == "__main__":
     root = tk.Tk()
